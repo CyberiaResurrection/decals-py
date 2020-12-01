@@ -1,11 +1,15 @@
+import os
 from kivy.config import Config
+#Config.set('graphics', 'width', '800')
+#Config.set('graphics', 'height', '440')
+os.environ["KIVY_IMAGE"] = "pil"
 
 Config.set("kivy", "exit_on_escape", "0")
 
 from wifi import Cell, Scheme
 import sys
 import traceback
-import os
+
 import urllib.request
 import json
 import math
@@ -16,6 +20,7 @@ import _thread
 import requests
 import wget
 from urllib.parse import urlparse
+import qrcode
 
 from kivy.app import App
 from kivy.core.window import Window
@@ -40,6 +45,7 @@ from kivy.uix.recycleview.layout import LayoutSelectionBehavior
 
 confgiPath = "/home/pi/config.json"
 
+
 class Environment:
     def __init__(self, url, staging, active):
         self.url = url
@@ -50,21 +56,24 @@ class Environment:
 config = {
     "ssid": "VIRGIN730",
     "password": "Password",
-    "id": "",
+    "id": "61692",
     "environments": [
         {
-            "url": "https://beercrawl.crawlmedia.com.au/api/v1/ontap/",
+            "apiURL": "https://beercrawl.crawlmedia.com.au/api/v1/ontap/",
+            "adResourceURL": "https://beercrawl.crawlmedia.com.au/images/decaladvert/",
+            "beerResourceURL": "https://beercrawl.com.au/beer",
             "staging": True,
             "active": True,
         },
         {
-            "url": "https://beercrawl.com.au/api/v1/ontap/",
+            "apiURL": "https://beercrawl.com.au/api/v1/ontap/",
+            "adResourceURL": "https://beercrawl.com.au/images/decaladvert/",
+            "beerResourceURL": "https://beercrawl.com.au/beer",
             "staging": False,
             "active": False,
         },
     ],
     "ad_time": 8,
-    "img_root": "https://beercrawl.crawlmedia.com.au/images/decaladvert/",
 }
 
 data = None
@@ -103,7 +112,6 @@ Builder.load_string(
 """
 )
 
-
 cells = list(Cell.all("wlan0"))
 configuredCellIndex = -1
 
@@ -128,16 +136,32 @@ def saveConfiguration():
         print(traceback.format_exc())
 
 
-def getApiUrl():
+def get_urls():
     global config
 
     try:
         for i in range(len(config["environments"])):
             if config["environments"][i]["active"]:
-                return config["environments"][i]["url"]
-        return config["environments"][0]["url"]
+                return {
+                    "api": config["environments"][i]["apiURL"],
+                    "adResource": config["environments"][i]["adResourceURL"],
+                    "beerResource": config["environments"][i]["beerResourceURL"],
+                }
+        return config["environments"][0]["apiURL"]
     except:
         print(traceback.format_exc())
+    return {}
+
+
+def get_qr_code_url():
+    global config
+    global data
+
+    root = get_urls()["beerResource"] + "/"
+    root += data["items"]["slug"]
+    root += "?justhadone=true&venue_id="
+    root += config["id"]
+    return root
 
 
 def getStaging():
@@ -151,7 +175,9 @@ def getStaging():
     except:
         print(traceback.format_exc())
 
+
 saveConfiguration()
+
 
 def volumeToDrinks(volume):
     return round(1.61 / 425 * 1000.0 * volume, 2)
@@ -355,7 +381,6 @@ class ConnectionScreen(Screen):
         layout.add_widget(self.hintLabel)
         self.add_widget(layout)
 
-        self.startConnect()
         return None
 
     def startConnect(self):
@@ -488,8 +513,10 @@ class ConnectionScreen(Screen):
                 self.connectLabel.text = "Connected"
                 time.sleep(3)
                 if config["id"] == "":
+                    print("Switching to Login")
                     self.parent.current = "login"
                 else:
+                    print("Switching to Main")
                     self.parent.current = "main"
             else:
                 self.anim.stop(self.spinner)
@@ -571,6 +598,43 @@ class LoginScreen(Screen):
             text += " "
 
         self.loginInput.text = "[font=Raleway-Regular.ttf]" + text + "[/font]"
+
+    def checkId(self):
+        global config
+
+        success = True
+
+        print("Checking new ID")
+        try:
+            url = get_urls()["api"] + config["id"]
+            print("Loading JSON")
+            print(url)
+            response = urllib.request.urlopen(url)
+            print("Request response status: " + str(response.status))
+            if response.status == 200:
+                print("JSON loaded for tap code " + config["id"])
+                testData = json.loads(response.read().decode())
+                if testData["status"] == "ERROR":
+                    print("Status = ERROR")
+                    success = False
+                else:
+                    time.sleep(2)
+                    mainScreen.start_get_data(dt=None)
+                    sm.current = "main"
+            else:
+                print(
+                    "Failed loading JSON for tap code "
+                    + config["id"]
+                    + ". Status code: "
+                    + str(response.status)
+                )
+                success = False
+        except:
+            success = False
+            print(traceback.format_exc())
+
+        if not success:
+            self.hintLabel.text = "Error.\r\nPlease check Tap Code"
 
 
 class Tap(BoxLayout):
@@ -767,10 +831,13 @@ class MainScreen(Screen):
         super(MainScreen, self).__init__(**kwargs)
 
         global config
-        self.itemIndex = 0
-        self.itemCount = 1
+        self.item_index = 0
+        self.sequence = []
         self.data = None
         self.omxProcess = None
+        self.header_source = None
+        self.advert_sources = []
+        self.loading = False
 
         self.layout = FloatLayout()
 
@@ -792,7 +859,12 @@ class MainScreen(Screen):
         self.items = []
 
         self.header = Image(
-            source="blank.png", pos=[720, 320], size=[720, 600], opacity=1.0
+            source="blank.png",
+            pos=[720, 320],
+            size=[720, 600],
+            opacity=1.0,
+            anim_delay=0,
+            keep_data=True,
         )
 
         self.layout.add_widget(self.header)
@@ -817,21 +889,24 @@ class MainScreen(Screen):
 
         def next_item(dt):
             global config
-            if self.itemCount > 1:
-                nextItemIndex = self.itemIndex + 1
-                if nextItemIndex > self.itemCount - 1:
-                    nextItemIndex = 0
+            if len(self.sequence) > 1:
+                next_item_index = self.item_index + 1
+                if next_item_index > len(self.sequence) - 1:
+                    next_item_index = 0
 
-                print("Switching to item ", nextItemIndex)
+                print("Switching to item ", next_item_index)
 
-                self.items[nextItemIndex].x = 720
+                p = self.sequence[self.item_index]
+                n = self.sequence[next_item_index]
+
+                self.items[n].x = 720
 
                 anim1 = Animation(opacity=0.0, x=-720)
                 anim2 = Animation(opacity=1.0, x=0)
-                anim1.start(self.items[self.itemIndex])
-                anim2.start(self.items[nextItemIndex])
+                anim1.start(self.items[p])
+                anim2.start(self.items[n])
 
-                self.itemIndex = nextItemIndex
+                self.item_index = next_item_index
 
             Clock.schedule_once(next_item, config["ad_time"])
 
@@ -842,40 +917,98 @@ class MainScreen(Screen):
         return None
 
     def start_get_data(self, dt):
-        _thread.start_new_thread(self.get_data, ())
+        if config["id"] == "":
+            print("Empty ID")
+            Clock.schedule_once(self.start_get_data, 10)
+        elif self.parent == None:
+            print("No parent")
+            Clock.schedule_once(self.start_get_data, 10)
+        elif self.parent.current != "main":
+            print("Current is not main")
+            Clock.schedule_once(self.start_get_data, 10)
+        elif self.loading:
+            print("Loading in progress")
+            Clock.schedule_once(self.start_get_data, 10)
+        else:
+            _thread.start_new_thread(self.get_data, ())
 
     def get_data(self):
         global data
         global newData
         global config
 
-        if config["id"] == "":
-            print("Empty ID")
-        else:
-            try:
-                url = getApiUrl() + config["id"]
-                print("Loading JSON")
-                print(url)
-                response = urllib.request.urlopen(url)
+        try:
+            url = get_urls()["api"] + config["id"]
+            print("Loading JSON")
+            print(url)
+            response = urllib.request.urlopen(url)
+            if response.status == 200:
                 newData = json.loads(response.read().decode())
-                print("Data loaded for tap code " + config["id"])
+                print("JSON loaded for tap code " + config["id"])
 
                 if newData == data:
-                    print("Data not changed")
+                    print("JSON not changed")
                 else:
-                    print("Data has changed. Updating")
-                    Clock.schedule_once(self.apply_data)
-            except:
-                print(traceback.format_exc())
+                    print("JSON has changed. Loading new data.")
+                    self.load_data()
+            else:
+                print(
+                    "Failed loading JSON for tap code "
+                    + config["id"]
+                    + ". Status code: "
+                    + str(response.status)
+                )
+        except:
+            print(traceback.format_exc())
 
         Clock.schedule_once(self.start_get_data, 10)
 
     def apply_data(self, dt):
+        global data
+        global config
+
+        print("Applying data")
+
+        for i in range(len(self.advert_sources)):
+            print("Advert " + str(i + 1))
+            self.items[i + 2].source = self.advert_sources[i]
+
+        print("Tap info")
+        self.items[0].apply_data(data)
+        self.items[0].x = 0
+
+        print("QR code")
+        self.items[1].source = "qr-code.png"
+
+        self.header.x = 0
+        self.statusLabel.x = 720
+
+        self.sequence = []
+        count = len(newData["items"]["adverts"])
+        if newData["items"]["disableQR"]:
+            print("QR code is disabled")
+            for i in range(count):
+                self.sequence.append(0)
+                self.sequence.append(i + 2)
+        else:
+            print("QR code is enabled")
+            for i in range(count):
+                self.sequence.append(0)
+                self.sequence.append(1)
+                self.sequence.append(i + 2)
+
+        print("Header")
+        self.header.source = self.header_source
+
+        print("Done")
+
+    def load_data(self):
         global config
         global data
         global newData
 
-        print("Applying data")
+        print("Loading data")
+        self.loading = True
         try:
             print("Loading header")
             img_url = newData["items"]["img"]
@@ -886,29 +1019,46 @@ class MainScreen(Screen):
                 os.remove(img_file)
             print(img_url)
             wget.download(img_url, out=img_file)
-            self.header.source = img_file
+            self.header_source = img_file
+            print("")
 
+            self.advert_sources = []
             for i in range(len(newData["items"]["adverts"])):
                 print("Loading advert " + str(i + 1))
                 img_file = newData["items"]["adverts"][i]["filename"]
-                img_url = config["img_root"] + img_file
+                img_url = get_urls()["adResource"] + img_file
                 print(img_url)
                 if os.path.exists(img_file):
                     os.remove(img_file)
-                print(img_url)
                 wget.download(img_url, out=img_file)
-                self.items[i + 1].source = img_file
+                self.advert_sources.append(img_file)
                 print("")
 
-            self.items[0].apply_data(newData)
-            self.items[0].x = 0
-            self.header.x = 0
-            self.statusLabel.x = 720
-            self.itemCount = len(newData["items"]["adverts"]) + 1
-
             data = newData
+
+            print("Generating QR code")
+            url = get_qr_code_url()
+            print("QR code link: " + url)
+
+            qr = qrcode.QRCode(
+                box_size=10,
+                border=0,
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+
+            img = qr.make_image(fill_color="white", back_color="black")
+
+            with open("qr-code.png", "wb") as f:
+                img.save(f)
+
+            print("Loading is completed")
+
+            Clock.schedule_once(self.apply_data)
         except:
             print(traceback.format_exc())
+
+        self.loading = False
 
 
 connectionScreen = ConnectionScreen(name="connection")
@@ -933,6 +1083,7 @@ class PasswordApp(App):
         self._keyboard.bind(on_key_down=self._on_keyboard_down)
 
         Window.show_cursor = False
+        connectionScreen.startConnect()
 
         return sm
 
@@ -972,8 +1123,7 @@ class PasswordApp(App):
             if keycode[1] == "enter":
                 config["id"] = loginScreen.login
                 saveConfiguration()
-                mainScreen.start_get_data(dt=None)
-                sm.current = "main"
+                loginScreen.checkId()
             elif keycode[1] == "backspace":
                 if len(loginScreen.login) > 0:
                     loginScreen.login = loginScreen.login[:-1]
@@ -992,6 +1142,7 @@ class PasswordApp(App):
         # Main Screen =========================================================
         elif sm.current == "main":
             if keycode[1] == "escape":
+                loginScreen.hintLabel.text = "Press Enter to apply"
                 loginScreen.login = config["id"]
                 sm.current = "login"
 
