@@ -1,0 +1,1 @@
+{"ssid": "VIRGIN730", "password": "Password", "id": "17183", "environments": [{"url": "https://beercrawl.crawlmedia.com.au/api/v1/ontap/", "staging": true, "active": true}, {"url": "https://beercrawl.com.au/api/v1/ontap/", "staging": false, "active": false}], "ad_time": 8, "img_root": "https://beercrawl.crawlmedia.com.au/images/decaladvert/"}
