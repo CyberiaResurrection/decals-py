@@ -1,7 +1,9 @@
 import os
 from kivy.config import Config
-#Config.set('graphics', 'width', '800')
-#Config.set('graphics', 'height', '440')
+Config.set('graphics', 'fullscreen', 'auto')
+Config.set('graphics', 'window_state', 'maximized')
+# Config.write()
+# YourApp().run()
 os.environ["KIVY_IMAGE"] = "pil"
 
 Config.set("kivy", "exit_on_escape", "0")
